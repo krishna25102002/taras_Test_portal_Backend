@@ -1,13 +1,7 @@
-const axios = require('axios'); // For making HTTP requests to JSON Server
+const axios = require('axios');
 const { sendEmail } = require("../utils/emailSender");
-const bcrypt = require("bcryptjs"); // For password hashing
-const User = require("../models/User"); // Import the User model
-
-// In-memory storage for OTPs
-const otpStorage = {};
-
-// In-memory storage for reset tokens
-const resetTokenStorage = {};
+const bcrypt = require("bcryptjs");
+const User = require("../models/User");
 
 // Helper function to hash passwords
 const hashPassword = async (password) => {
@@ -19,36 +13,32 @@ const hashPassword = async (password) => {
 const registerUser = async (req, res) => {
   const { email, password } = req.body;
 
-  console.log("Received registration request for email:", email); // Log the email
+  console.log("Received registration request for email:", email);
 
   try {
-    // Check if the user already exists in MongoDB (case-insensitive query)
     const userExists = await User.findOne({
       email: { $regex: new RegExp(`^${email}$`, "i") },
     });
 
     if (userExists) {
-      console.log("User already exists:", email); // Log if user exists
+      console.log("User already exists:", email);
       return res.status(400).json({ message: "User already exists" });
     }
 
-    // Hash the password
     const hashedPassword = await hashPassword(password);
 
-    // Create a new user in MongoDB
     const newUser = new User({
       email,
       password: hashedPassword,
     });
 
-    // Save the user to MongoDB
     await newUser.save();
     console.log("User registered successfully in MongoDB:", newUser);
 
-    // Save the user to JSON Server (db.json)
     const jsonServerResponse = await axios.post('http://localhost:3000/users', {
+      id: newUser._id.toString(),
       email,
-      password: hashedPassword, // Store the hashed password in db.json
+      password: hashedPassword,
     });
 
     console.log("User registered successfully in JSON Server:", jsonServerResponse.data);
@@ -56,13 +46,10 @@ const registerUser = async (req, res) => {
     res.status(201).json({ message: "User registered successfully" });
   } catch (error) {
     console.error("Error registering user:", error);
-
-    // If saving to JSON Server fails, delete the user from MongoDB to maintain consistency
     if (newUser) {
       await User.deleteOne({ email });
       console.log("User deleted from MongoDB due to JSON Server error");
     }
-
     res.status(500).json({ message: "Failed to register user" });
   }
 };
@@ -71,18 +58,27 @@ const registerUser = async (req, res) => {
 const sendOTP = async (req, res) => {
   const { email } = req.body;
 
-  console.log("Sending OTP to:", email); // Log the email
+  console.log("Sending OTP to:", email);
 
   try {
-    // Generate a 6-digit OTP
-    const otp = Math.floor(100000 + Math.random() * 900000);
-    console.log("Generated OTP:", otp); // Log the OTP
+    const user = await User.findOne({
+      email: { $regex: new RegExp(`^${email}$`, "i") },
+    });
 
-    // Store OTP in memory with a 5-minute expiration
-    otpStorage[email] = { otp, expiresAt: Date.now() + 300000 }; // 5 minutes
-    console.log("OTP stored in memory:", otpStorage[email]); // Log the stored OTP
+    if (!user) {
+      console.log("User not found:", email);
+      return res.status(404).json({ message: "User not found" });
+    }
 
-    // Send OTP via email
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    console.log("Generated OTP:", otp);
+
+    user.otp = otp;
+    user.otpExpiry = Date.now() + 5 * 60 * 1000; // 5 minutes
+    await user.save();
+
+    console.log("OTP stored in MongoDB:", { otp, expiresAt: user.otpExpiry });
+
     await sendEmail(email, "Your OTP for Verification", `Your OTP is: ${otp}`);
     res.status(200).json({ message: "OTP sent successfully" });
   } catch (error) {
@@ -95,20 +91,37 @@ const sendOTP = async (req, res) => {
 const verifyOTP = async (req, res) => {
   const { email, otp } = req.body;
 
-  try {
-    const storedOTP = otpStorage[email];
+  console.log("Verifying OTP for:", email, "with OTP:", otp);
 
-    if (!storedOTP || storedOTP.otp != otp) {
+  try {
+    const user = await User.findOne({
+      email: { $regex: new RegExp(`^${email}$`, "i") },
+    });
+
+    if (!user) {
+      console.log("User not found:", email);
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    console.log("User found:", user);
+
+    if (!user.otp || user.otp !== otp) {
+      console.log("Invalid OTP for:", email, "Stored OTP:", user.otp);
       return res.status(400).json({ message: "Invalid OTP" });
     }
 
-    if (storedOTP.expiresAt < Date.now()) {
-      delete otpStorage[email]; // Clear expired OTP
+    if (user.otpExpiry < Date.now()) {
+      console.log("OTP expired for:", email);
+      user.otp = null;
+      user.otpExpiry = null;
+      await user.save();
       return res.status(400).json({ message: "OTP has expired" });
     }
 
-    // OTP is valid
-    delete otpStorage[email]; // Clear OTP after verification
+    user.otp = null;
+    user.otpExpiry = null;
+    await user.save();
+
     res.status(200).json({ message: "OTP verified successfully" });
   } catch (error) {
     console.error("Error verifying OTP:", error);
@@ -123,7 +136,6 @@ const forgotPassword = async (req, res) => {
   try {
     console.log("Forgot Password Request for email:", email);
 
-    // Check if the user exists in MongoDB (case-insensitive query)
     const user = await User.findOne({
       email: { $regex: new RegExp(`^${email}$`, "i") },
     });
@@ -133,28 +145,20 @@ const forgotPassword = async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Generate a reset token (e.g., a random string or OTP)
-    const resetToken = Math.floor(100000 + Math.random() * 900000); // 6-digit OTP
-    const resetTokenExpiry = Date.now() + 10 * 60 * 1000; // 10 minutes
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpExpiry = Date.now() + 10 * 60 * 1000;
 
-    // // Store the reset token in memory
-    // resetTokenStorage[email] = {
-    //   resetToken,
-    //   resetTokenExpiry,
-    // };
-      // Save the reset token and expiry in MongoDB
-      user.resetToken = resetToken;
-      user.resetTokenExpiry = resetTokenExpiry;
-      await user.save();
+    user.otp = otp;
+    user.otpExpiry = otpExpiry;
+    await user.save();
 
-    console.log("Reset token generated and stored in memory:", resetToken);
-    console.log("Reset token expiry:", new Date(resetTokenExpiry).toLocaleString());
+    console.log("OTP generated and stored in MongoDB:", otp);
+    console.log("OTP expiry:", new Date(otpExpiry).toLocaleString());
 
-    // Send the reset token to the user's email
     await sendEmail(
       email,
       "Password Reset Request",
-      `Your password reset OTP is: ${resetToken}`
+      `Your password reset OTP is: ${otp}`
     );
 
     res.status(200).json({ message: "Reset OTP sent to your email" });
@@ -166,13 +170,10 @@ const forgotPassword = async (req, res) => {
 
 // Reset Password
 const resetPassword = async (req, res) => {
-  const { email, resetToken, newPassword } = req.body;
-  console.log("Reset Password Request:", { email, resetToken });
+  const { email, otp, newPassword } = req.body;
+  console.log("Reset Password Request:", { email, otp });
 
   try {
-    console.log("Reset Password Request for email:", email);
-
-    // Check if the user exists in MongoDB (case-insensitive query)
     const user = await User.findOne({
       email: { $regex: new RegExp(`^${email}$`, "i") },
     });
@@ -184,40 +185,38 @@ const resetPassword = async (req, res) => {
 
     console.log("User found:", user);
 
-    // Verify the reset token
-    if (!user.resetToken || user.resetToken !== resetToken) {
-      console.log("Invalid reset token for:", email);
-      return res.status(400).json({ message: "Invalid reset token" });
+    if (!user.otp || user.otp !== otp) {
+      console.log("Invalid OTP for:", email, "Stored OTP:", user.otp);
+      return res.status(400).json({ message: "Invalid OTP" });
     }
 
-    // Check if the reset token has expired
-    if (user.resetTokenExpiry < Date.now()) {
-      console.log("Reset token has expired for:", email);
-      return res.status(400).json({ message: "Reset token has expired" });
+    if (user.otpExpiry < Date.now()) {
+      console.log("OTP has expired for:", email);
+      user.otp = null;
+      user.otpExpiry = null;
+      await user.save();
+      return res.status(400).json({ message: "OTP has expired" });
     }
 
-    // Hash the new password before saving
     const hashedPassword = await hashPassword(newPassword);
     console.log("New password hashed successfully");
 
-    // Update the password and clear the reset token in MongoDB
     user.password = hashedPassword;
-    user.resetToken = null; // Clear the resetToken
-    user.resetTokenExpiry = null; // Clear the resetTokenExpiry
+    user.otp = null;
+    user.otpExpiry = null;
     await user.save();
 
-    // Update the password in JSON Server
     try {
-      const jsonServerResponse = await axios.patch(`http://localhost:3000/users/${user.id}`, {
+      const jsonServerResponse = await axios.patch(`http://localhost:3000/users/${user._id}`, {
         password: hashedPassword,
-        resetToken: null, // Clear the resetToken in JSON Server
-        resetTokenExpiry: null, // Clear the resetTokenExpiry in JSON Server
+        otp: null,
+        otpExpiry: null,
       });
 
       console.log("Password updated successfully in JSON Server:", jsonServerResponse.data);
     } catch (jsonServerError) {
       console.error("Error updating password in JSON Server:", jsonServerError.response?.data || jsonServerError.message);
-      throw jsonServerError; // Re-throw the error to trigger the catch block
+      throw jsonServerError;
     }
 
     console.log("Password reset successfully in MongoDB and JSON Server");
@@ -229,93 +228,11 @@ const resetPassword = async (req, res) => {
   }
 };
 
-
-// const resetPassword = async (req, res) => {
-//   const { email, resetToken, newPassword } = req.body;
-//   console.log("Reset Password Request:", { email, resetToken });
-
-//   try {
-//     console.log("Reset Password Request for email:", email);
-
-//     // Check if the user exists in MongoDB (case-insensitive query)
-//     const user = await User.findOne({
-//       email: { $regex: new RegExp(`^${email}$`, "i") },
-//     });
-
-//     if (!user) {
-//       console.log("User not found in database:", email);
-//       return res.status(404).json({ message: "User not found" });
-//     }
-
-//     console.log("User found:", user);
-
-//     // // Verify the reset token from in-memory storage
-//     // const storedTokenData = resetTokenStorage[email];
-
-//       // Verify the reset token
-//       if (!user.resetToken || user.resetToken !== resetToken) {
-//         console.log("Invalid reset token for:", email);
-//         return res.status(400).json({ message: "Invalid reset token" });
-//       }
-
-
-
-//     if (!storedTokenData) {
-//       console.log("No reset token found for:", email);
-//       return res.status(400).json({ message: "Invalid reset token" });
-//     }
-
-//     console.log("Stored reset token data:", storedTokenData);
-
-//     if (storedTokenData.resetToken !== resetToken) {
-//       console.log("Invalid reset token for:", email);
-//       return res.status(400).json({ message: "Invalid reset token" });
-//     }
-
-//     // Check if the reset token has expired
-//     if (storedTokenData.resetTokenExpiry < Date.now()) {
-//       console.log("Reset token has expired for:", email);
-//       return res.status(400).json({ message: "Reset token has expired" });
-//     }
-
-//     // Hash the new password before saving
-//     const hashedPassword = await hashPassword(newPassword);
-//     console.log("New password hashed successfully");
-
-//     // Update the password in MongoDB
-//     user.password = hashedPassword;
-//     await user.save();
-//     console.log("Password updated successfully in MongoDB");
-
-//     // Update the password in JSON Server
-//     try {
-//       const jsonServerResponse = await axios.patch(`http://localhost:3000/users/${user.id}`, {
-//         password: hashedPassword,
-//       });
-
-//       console.log("Password updated successfully in JSON Server:", jsonServerResponse.data);
-//     } catch (jsonServerError) {
-//       console.error("Error updating password in JSON Server:", jsonServerError.response?.data || jsonServerError.message);
-//       throw jsonServerError; // Re-throw the error to trigger the catch block
-//     }
-
-//     // Clear the reset token from memory
-//     delete resetTokenStorage[email];
-//     console.log("Reset token cleared from memory for:", email);
-
-//     res.status(200).json({ message: "Password reset successfully" });
-//   } catch (error) {
-//     console.error("Error in reset password:", error);
-//     res.status(500).json({ message: "Failed to reset password" });
-//   }
-// };
-
 // Login User
 const loginUser = async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    // Check if the user exists in MongoDB (case-insensitive query)
     const user = await User.findOne({
       email: { $regex: new RegExp(`^${email}$`, "i") },
     });
@@ -324,20 +241,18 @@ const loginUser = async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Verify the password
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
       return res.status(400).json({ message: "Invalid credentials" });
     }
 
-    // Send a success message (do not send credentials)
     await sendEmail(
       email,
       "Login Successful",
       `You have successfully logged in.`
     );
 
-    res.status(200).json({ message: "Login successful", user });
+    res.status(200).json({ message: "Login successful", user: { email: user.email } });
   } catch (error) {
     console.error("Error in login:", error);
     res.status(500).json({ message: "Failed to login" });
